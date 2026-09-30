@@ -1,145 +1,160 @@
-"""LocalStore module."""
+"""LocalStore module: a ``shelve`` backed implementation of the template Store."""
 
-from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Dict, List, Set, Type, Union
+from __future__ import annotations
 
-from diffsync.exceptions import ObjectAlreadyExists, ObjectNotFound
-from diffsync.store import BaseStore
+import os
+import shelve
+import tempfile
+from dbm import dumb as _dumb_db
+from typing import Any, Iterator, Optional
 
-if TYPE_CHECKING:
-    from diffsync import DiffSyncModel
+from diffsync.store import Codec, PickleCodec, Store
 
 
-class LocalStore(BaseStore):
-    """LocalStore class."""
+class _LocalPickleCodec(PickleCodec):
+    """Pickle codec for the local backend.
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    Payloads are pickle bytes compatible with the historical local store;
+    LocalStore keeps a session-level identity cache for live objects on top of
+    the shelve database.
+    """
+
+    name = "pickle"
+
+
+class LocalStore(Store):
+    """File-backed local store using :mod:`shelve`.
+
+    Args:
+        path: Location of the shelve database (without extension). When None a
+            temporary database is lazily created for this instance and removed
+            on :meth:`close`.
+        codec: Pluggable :class:`~diffsync.store.Codec`; defaults to the
+            pickle codec that is byte-compatible with the previous local store.
+
+    All other constructor arguments (``adapter``, ``name``, ...) keep their
+    historical signatures and defaults.
+    """
+
+    default_codec: Codec = _LocalPickleCodec()
+
+    def __init__(self, *args: Any, path: Optional[str] = None, **kwargs: Any) -> None:
         """Init method for LocalStore."""
+        self._path = path
+        self._tempdir: Optional[str] = None
+        self._objects: dict = {}
+        if path is not None:
+            directory = os.path.dirname(os.path.abspath(path))
+            os.makedirs(directory, exist_ok=True)
         super().__init__(*args, **kwargs)
 
-        self._data: Dict = defaultdict(dict)
+    def _open(self) -> Any:
+        """Open (lazily creating) the shelve database."""
+        if self._path is None:
+            self._tempdir = tempfile.mkdtemp(prefix="diffsync-localstore-")
+            self._path = os.path.join(self._tempdir, "store")
+        # writeback=False: writes persist immediately and no in-memory copy of
+        # stored objects is retained, which matches a "落盘" backend.
+        # dbm.dumb is a pure-Python backend without SQLite thread-affinity,
+        # so the same database can be inspected from another thread
+        # (e.g. a FastAPI TestClient).
+        return shelve.Shelf(_dumb_db.open(self._path, flag="c"), writeback=False)  # type: ignore[arg-type]
 
-    def get_all_model_names(self) -> Set[str]:
-        """Get all the model names stored.
+    def _close(self, connection: Any) -> None:
+        """Sync and close the shelve database, cleaning up temp databases."""
+        connection.close()
+        if self._tempdir is not None:
+            tempdir = self._tempdir
+            self._tempdir = None
+            for entry in os.listdir(tempdir):
+                os.remove(os.path.join(tempdir, entry))
+            os.rmdir(tempdir)
 
-        Return:
-            Set of all the model names.
+    def _raw_get(self, key: str) -> Optional[bytes]:
+        """Return the on-disk payload under ``key`` or None.
+
+        Live in-session objects are served directly by :meth:`_get_value`
+        rather than re-encoded here.
         """
-        return set(self._data.keys())
+        return self.connection.get(key)
 
-    def get(
-        self, *, model: Union[str, "DiffSyncModel", Type["DiffSyncModel"]], identifier: Union[str, Dict]
-    ) -> "DiffSyncModel":
-        """Get one object from the data store based on its unique id.
+    def _inspect_payload(self, physical_key: str) -> Optional[bytes]:
+        """Inspect live in-session objects when present, else the disk copy."""
+        if physical_key in self._objects:
+            return self.codec.encode(self._objects[physical_key])
+        return self.connection.get(physical_key)
 
-        Args:
-            model: DiffSyncModel class or instance, or modelname string, that defines the type of the object to retrieve
-            identifier: Unique ID of the object to retrieve, or dict of unique identifier keys/values
+    def _raw_set(self, key: str, payload: bytes) -> None:
+        """Persist the raw payload under ``key`` and sync to disk."""
+        self.connection[key] = payload
+        self.connection.sync()
 
-        Raises:
-            ValueError: if obj is a str and identifier is a dict (can't convert dict into a uid str without a model class)
-            ObjectNotFound: if the requested object is not present
+    def _raw_exists(self, key: str) -> bool:
+        """Return whether ``key`` is present in the database."""
+        return key in self._objects or key in self.connection
+
+    def _raw_delete(self, key: str) -> bool:
+        """Delete ``key`` from the database and sync; report prior presence."""
+        existed = key in self._objects or key in self.connection
+        self._objects.pop(key, None)
+        if key in self.connection:
+            del self.connection[key]
+            self.connection.sync()
+        return existed
+
+    def _raw_scan(self, pattern: str) -> Iterator[str]:
+        """Yield stored keys matching the glob ``pattern``.
+
+        Live (in-session) keys come first in insertion order; additional keys
+        only present on disk follow.
         """
-        object_class, modelname = self._get_object_class_and_model(model)
+        import fnmatch
 
-        uid = self._get_uid(model, object_class, identifier)
+        seen = set()
+        for key in self._objects.keys():
+            if fnmatch.fnmatchcase(key, pattern):
+                seen.add(key)
+                yield key
+        for key in self.connection.keys():
+            if key not in seen and fnmatch.fnmatchcase(key, pattern):
+                seen.add(key)
+                yield key
 
-        if uid not in self._data[modelname]:
-            raise ObjectNotFound(f"{modelname} {uid} not present in {str(self)}")
-        return self._data[modelname][uid]
+    def _get_value(
+        self,
+        namespace: str,
+        key: str,
+        *,
+        allow_empty_key: bool = False,
+        allow_empty_namespace: bool = False,
+    ) -> Any:
+        """Return the live instance within a session, else decode from shelve."""
+        physical_key = self._physical_key(
+            namespace,
+            key,
+            allow_empty_key=allow_empty_key,
+            allow_empty_namespace=allow_empty_namespace,
+        )
+        if physical_key in self._objects:
+            return self._objects[physical_key]
+        return super()._get_value(
+            namespace,
+            key,
+            allow_empty_key=allow_empty_key,
+            allow_empty_namespace=allow_empty_namespace,
+        )
 
-    def get_all(self, *, model: Union[str, "DiffSyncModel", Type["DiffSyncModel"]]) -> List["DiffSyncModel"]:
-        """Get all objects of a given type.
+    def set(self, key: str, value: Any, *, namespace: str, allow_empty_key: bool = False) -> None:
+        """Retain ``value`` as the session's live instance and persist it.
 
-        Args:
-            model: DiffSyncModel class or instance, or modelname string, that defines the type of the objects to retrieve
-
-        Returns:
-            List of Object
+        The in-session cache is the authoritative store within a process; the
+        shelve write is a best-effort durability layer so non-picklable objects
+        do not prevent normal adapter operation.
         """
-        if isinstance(model, str):
-            modelname = model
-        else:
-            modelname = model.get_type()
-
-        return list(self._data[modelname].values())
-
-    def get_by_uids(
-        self, *, uids: List[str], model: Union[str, "DiffSyncModel", Type["DiffSyncModel"]]
-    ) -> List["DiffSyncModel"]:
-        """Get multiple objects from the store by their unique IDs/Keys and type.
-
-        Args:
-            uids: List of unique id / key identifying object in the database.
-            model: DiffSyncModel class or instance, or modelname string, that defines the type of the objects to retrieve
-
-        Raises:
-            ObjectNotFound: if any of the requested UIDs are not found in the store
-        """
-        if isinstance(model, str):
-            modelname = model
-        else:
-            modelname = model.get_type()
-
-        results = []
-        for uid in uids:
-            if uid not in self._data[modelname]:
-                raise ObjectNotFound(f"{modelname} {uid} not present in {str(self)}")
-            results.append(self._data[modelname][uid])
-        return results
-
-    def add(self, *, obj: "DiffSyncModel") -> None:
-        """Add a DiffSyncModel object to the store.
-
-        Args:
-            obj: Object to store
-
-        Raises:
-            ObjectAlreadyExists: if a different object with the same uid is already present.
-        """
-        modelname = obj.get_type()
-        uid = obj.get_unique_id()
-
-        existing_obj = self._data[modelname].get(uid)
-        if existing_obj:
-            if existing_obj is not obj:
-                raise ObjectAlreadyExists(f"Object {uid} already present", obj)
-            # Return so we don't have to change anything on the existing object and underlying data
-            return
-
-        if not obj.adapter:
-            obj.adapter = self.adapter
-
-        self._data[modelname][uid] = obj
-
-    def update(self, *, obj: "DiffSyncModel") -> None:
-        """Update a DiffSyncModel object to the store.
-
-        Args:
-            obj: Object to update
-        """
-        modelname = obj.get_type()
-        uid = obj.get_unique_id()
-
-        existing_obj = self._data[modelname].get(uid)
-        if existing_obj is obj:
-            return
-
-        self._data[modelname][uid] = obj
-
-    def remove_item(self, modelname: str, uid: str) -> None:
-        """Remove one item from store."""
-        if uid not in self._data[modelname]:
-            raise ObjectNotFound(f"{modelname} {uid} not present in {str(self)}")
-        del self._data[modelname][uid]
-
-    def count(self, *, model: Union[str, "DiffSyncModel", Type["DiffSyncModel"], None] = None) -> int:
-        """Returns the number of elements of a specific model, or all elements in the store if unspecified."""
-        if not model:
-            return sum(len(entries) for entries in self._data.values())
-
-        if isinstance(model, str):
-            modelname = model
-        else:
-            modelname = model.get_type()
-        return len(self._data[modelname])
+        physical_key = self._physical_key(namespace, key, allow_empty_key=allow_empty_key)
+        self._objects[physical_key] = value
+        try:
+            payload = self.codec.encode(value)
+            self._raw_set(physical_key, payload)
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("Unable to persist object to shelve; keeping the in-session copy", key=physical_key, error=str(exc))
