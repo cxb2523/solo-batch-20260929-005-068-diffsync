@@ -1,19 +1,28 @@
-"""RedisStore module."""
+"""RedisStore module.
 
-import copy
+The historical Redis wire format is preserved byte-for-byte:
+
+* key layout: ``diffsync:<store_id>:<modelname>:<uid>``
+* values: plain pickle payloads of the model with ``adapter`` unset
+
+No migration is performed and no protocol/version marker is added.
+"""
+
+from __future__ import annotations
+
 import uuid
-from pickle import dumps, loads  # nosec
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Type, Union
+from typing import TYPE_CHECKING, Any, Iterator, Optional, Tuple
 
 try:
     from redis import Redis
     from redis.exceptions import ConnectionError as RedisConnectionError
+    from redis.exceptions import RedisError
 except ImportError as ierr:
     print("Redis is not installed. Have you installed diffsync with redis extra? `pip install diffsync[redis]`")
     raise ierr
 
-from diffsync.exceptions import ObjectAlreadyExists, ObjectNotFound, ObjectStoreException
-from diffsync.store import BaseStore
+from diffsync.exceptions import ObjectNotFound, ObjectStoreException
+from diffsync.store import PickleCodec, Store
 
 if TYPE_CHECKING:
     from diffsync import DiffSyncModel
@@ -21,8 +30,17 @@ if TYPE_CHECKING:
 REDIS_DIFFSYNC_ROOT_LABEL = "diffsync"
 
 
-class RedisStore(BaseStore):
-    """RedisStore class."""
+class RedisStore(Store):
+    """Redis-backed store.
+
+    The constructor signature is unchanged compared to the previous
+    implementation; the Redis client itself is created lazily while the
+    availability check (``ping``) keeps raising :class:`ObjectStoreException`
+    at construction time as before. An extra ``client`` keyword may be passed
+    to inject an already-constructed client (used by the fakeredis tests).
+    """
+
+    default_codec = PickleCodec()
 
     def __init__(  # pylint: disable=too-many-arguments
         self,
@@ -32,189 +50,96 @@ class RedisStore(BaseStore):
         port: int = 6379,
         url: Optional[str] = None,
         db: int = 0,
+        client: Optional[Redis] = None,
         **kwargs: Any,
-    ):
+    ) -> None:
         """Init method for RedisStore."""
-        super().__init__(*args, **kwargs)
-
         if url and host and port:
             raise ValueError("'url' and 'host' arguments can't be specified together.")
 
-        try:
-            if url:
-                self._store = Redis.from_url(url, db=db)
-            elif host:
-                self._store = Redis(host=host, port=port, db=db)
-            else:
-                raise RedisConnectionError("Neither 'host' nor 'url' were specified.")
-
-            if not self._store.ping():
-                raise RedisConnectionError()
-        except RedisConnectionError:
-            raise ObjectStoreException("Redis store is unavailable.") from RedisConnectionError
+        self._host = host
+        self._port = port
+        self._url = url
+        self._db = db
+        self._injected_client = client is not None
+        self._client = client
+        self._client_factory: Optional[Any] = None
 
         self._store_id = store_id if store_id else str(uuid.uuid4())
-
         self._store_label = f"{REDIS_DIFFSYNC_ROOT_LABEL}:{self._store_id}"
+
+        # super().__init__() opens (or verifies) the connection eagerly.
+        super().__init__(*args, **kwargs)
 
     def __str__(self) -> str:
         """Render store name."""
         return f"{self.name} ({self._store_id})"
 
+    @property
+    def _prefix_parts(self) -> Tuple[str, ...]:
+        """Root prefix segments: the historical ``diffsync:<store_id>`` label."""
+        return (REDIS_DIFFSYNC_ROOT_LABEL, self._store_id)
+
+    def _open(self) -> Redis:
+        """Build the lazy Redis client and verify availability via ping."""
+        if self._client is not None:
+            client = self._client
+        elif self._client_factory is not None:
+            client = self._client_factory()
+        elif self._url:
+            client = Redis.from_url(self._url, db=self._db)
+        elif self._host:
+            client = Redis(host=self._host, port=self._port, db=self._db)
+        else:
+            raise ObjectStoreException("Redis store is unavailable.")
+        try:
+            if not client.ping():
+                raise RedisConnectionError("Redis ping returned False")
+        except RedisError as exc:
+            raise ObjectStoreException("Redis store is unavailable.") from exc
+        self._client = client
+        if self._client_factory is None and not self._injected_client:
+            self._client_factory = lambda: client
+        return client
+
+    def _close(self, connection: Any) -> None:
+        """Close the client unless it was injected by the caller."""
+        if not self._injected_client:
+            connection.close()
+        self._client = None
+
+    def _raw_get(self, key: str) -> Optional[bytes]:
+        """Fetch the raw payload under ``key``."""
+        return self.connection.get(key)
+
+    def _raw_set(self, key: str, payload: bytes) -> None:
+        """Store the raw payload under ``key``."""
+        self.connection.set(key, payload)
+
+    def _raw_exists(self, key: str) -> bool:
+        """Return whether ``key`` exists."""
+        return bool(self.connection.exists(key))
+
+    def _raw_delete(self, key: str) -> bool:
+        """Delete ``key``; return whether it existed beforehand."""
+        return bool(self.connection.delete(key))
+
+    def _raw_scan(self, pattern: str) -> Iterator[Any]:
+        """Yield keys matching ``pattern`` using the historical SCAN approach."""
+        return self.connection.scan_iter(pattern)
+
+    # ------------------------------------------------------------------
+    # Backwards-compatible helpers from the original RedisStore
+    # ------------------------------------------------------------------
+    def _get_key_for_object(self, modelname: str, uid: str) -> str:
+        """Return the historical physical Redis key for a model and uid."""
+        return f"{self._store_label}:{modelname}:{uid}"
+
     def _get_object_from_redis_key(self, key: str) -> "DiffSyncModel":
-        """Get the object from Redis key."""
-        pickled_object = self._store.get(key)
+        """Read and decode an object directly from a physical Redis key."""
+        pickled_object = self.connection.get(key)
         if pickled_object:
-            obj_result = loads(pickled_object)  # noqa: S301
+            obj_result = self.codec.decode(pickled_object)
             obj_result.adapter = self.adapter
             return obj_result
         raise ObjectNotFound(f"{key} not present in Cache")
-
-    def get_all_model_names(self) -> Set[str]:
-        """Get all the model names stored.
-
-        Return:
-            Set of all the model names.
-        """
-        # TODO: optimize it
-        all_model_names = set()
-        for item in self._store.scan_iter(f"{self._store_label}:*"):
-            # Model Name is the third item in the Redis key
-            # b'diffsync:123:device:device1' -> Model name b'device'
-            model_name = item.split(b":")[2].decode()
-            all_model_names.add(model_name)
-
-        return all_model_names
-
-    def _get_key_for_object(self, modelname: str, uid: str) -> str:
-        return f"{self._store_label}:{modelname}:{uid}"
-
-    def get(
-        self, *, model: Union[str, "DiffSyncModel", Type["DiffSyncModel"]], identifier: Union[str, Dict]
-    ) -> "DiffSyncModel":
-        """Get one object from the data store based on its unique id.
-
-        Args:
-            model: DiffSyncModel class or instance, or modelname string, that defines the type of the object to retrieve
-            identifier: Unique ID of the object to retrieve, or dict of unique identifier keys/values
-
-        Raises:
-            ValueError: if obj is a str and identifier is a dict (can't convert dict into a uid str without a model class)
-            ObjectNotFound: if the requested object is not present
-        """
-        object_class, modelname = self._get_object_class_and_model(model)
-
-        uid = self._get_uid(model, object_class, identifier)
-
-        return self._get_object_from_redis_key(self._get_key_for_object(modelname, uid))
-
-    def get_all(self, *, model: Union[str, "DiffSyncModel", Type["DiffSyncModel"]]) -> List["DiffSyncModel"]:
-        """Get all objects of a given type.
-
-        Args:
-            model: DiffSyncModel class or instance, or modelname string, that defines the type of the objects to retrieve
-
-        Returns:
-            List of Object
-        """
-        if isinstance(model, str):
-            modelname = model
-        else:
-            modelname = model.get_type()
-
-        results: List["DiffSyncModel"] = []
-        for key in self._store.scan_iter(f"{self._store_label}:{modelname}:*"):
-            results.append(self._get_object_from_redis_key(key))  # type: ignore[arg-type]
-
-        return results
-
-    def get_by_uids(
-        self, *, uids: List[str], model: Union[str, "DiffSyncModel", Type["DiffSyncModel"]]
-    ) -> List["DiffSyncModel"]:
-        """Get multiple objects from the store by their unique IDs/Keys and type.
-
-        Args:
-            uids: List of unique id / key identifying object in the database.
-            model: DiffSyncModel class or instance, or modelname string, that defines the type of the objects to retrieve
-
-        Raises:
-            ObjectNotFound: if any of the requested UIDs are not found in the store
-        """
-        if isinstance(model, str):
-            modelname = model
-        else:
-            modelname = model.get_type()
-
-        results = []
-        for uid in uids:
-            results.append(self._get_object_from_redis_key(self._get_key_for_object(modelname, uid)))
-
-        return results
-
-    def add(self, *, obj: "DiffSyncModel") -> None:
-        """Add a DiffSyncModel object to the store.
-
-        Args:
-            obj: Object to store
-
-        Raises:
-            ObjectAlreadyExists: if a different object with the same uid is already present.
-        """
-        modelname = obj.get_type()
-        uid = obj.get_unique_id()
-
-        # Get existing Object
-        object_key = self._get_key_for_object(modelname, uid)
-
-        existing_obj_binary = self._store.get(object_key)
-        if existing_obj_binary:
-            existing_obj = loads(existing_obj_binary)  # noqa: S301
-            existing_obj_dict = existing_obj.dict()
-
-            if existing_obj_dict != obj.dict():
-                raise ObjectAlreadyExists(f"Object {uid} already present", obj)
-
-            # Return so we don't have to change anything on the existing object and underlying data
-            return
-
-        # Remove the diffsync object before sending to Redis
-        obj_copy = copy.copy(obj)
-        obj_copy.adapter = None
-
-        self._store.set(object_key, dumps(obj_copy))
-
-    def update(self, *, obj: "DiffSyncModel") -> None:
-        """Update a DiffSyncModel object to the store.
-
-        Args:
-            obj: Object to update
-        """
-        modelname = obj.get_type()
-        uid = obj.get_unique_id()
-
-        object_key = self._get_key_for_object(modelname, uid)
-        obj_copy = copy.copy(obj)
-        obj_copy.adapter = None
-
-        self._store.set(object_key, dumps(obj_copy))
-
-    def remove_item(self, modelname: str, uid: str) -> None:
-        """Remove one item from store."""
-        object_key = self._get_key_for_object(modelname, uid)
-
-        if not self._store.exists(object_key):
-            raise ObjectNotFound(f"{modelname} {uid} not present in Cache")
-
-        self._store.delete(object_key)
-
-    def count(self, *, model: Union[str, "DiffSyncModel", Type["DiffSyncModel"], None] = None) -> int:
-        """Returns the number of elements of a specific model, or all elements in the store if unspecified."""
-        search_pattern = f"{self._store_label}:*"
-        if model is not None:
-            if isinstance(model, str):
-                modelname = model
-            else:
-                modelname = model.get_type()
-            search_pattern = f"{self._store_label}:{modelname.lower()}:*"
-
-        return len(list(self._store.scan_iter(search_pattern)))
